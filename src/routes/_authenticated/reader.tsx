@@ -1,0 +1,602 @@
+import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
+import { useEffect, useMemo, useState } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useServerFn } from "@tanstack/react-start";
+import { toast, Toaster } from "sonner";
+import {
+  Rss,
+  Wand2,
+  Sparkles,
+  Loader2,
+  RefreshCw,
+  Plus,
+  Trash2,
+  CheckCheck,
+  ExternalLink,
+  LogOut,
+  Inbox,
+  Circle,
+  CircleCheck,
+  Menu,
+  MoreVertical,
+  ArrowUpToLine,
+  ArrowDownToLine,
+} from "lucide-react";
+
+import { supabase } from "@/integrations/supabase/client";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Checkbox } from "@/components/ui/checkbox";
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "@/components/ui/dialog";
+import { Sheet, SheetContent } from "@/components/ui/sheet";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
+  addFeed,
+  deleteFeed,
+  listFeeds,
+  listItems,
+  markAllRead,
+  markItemsRead,
+  refreshAllFeeds,
+  refreshFeed,
+} from "@/lib/reader.functions";
+
+export const Route = createFileRoute("/_authenticated/reader")({
+  head: () => ({
+    meta: [
+      { title: "Reader — Fae Feeds" },
+      { name: "description", content: "Your personal RSS reader." },
+    ],
+  }),
+  component: Reader,
+});
+
+type SelKey = string | "__all__";
+type FeedRow = {
+  id: string;
+  url: string;
+  title: string | null;
+  unread_count?: number;
+  last_refreshed_at?: string | null;
+  last_error?: string | null;
+};
+
+function Reader() {
+  const navigate = useNavigate();
+  const qc = useQueryClient();
+  const [selected, setSelected] = useState<SelKey>("__all__");
+  const [unreadOnly, setUnreadOnly] = useState(false);
+  const [addOpen, setAddOpen] = useState(false);
+  const [newUrl, setNewUrl] = useState("");
+  const [checked, setChecked] = useState<Record<string, boolean>>({});
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+
+  const feedsFn = useServerFn(listFeeds);
+  const itemsFn = useServerFn(listItems);
+  const addFn = useServerFn(addFeed);
+  const delFn = useServerFn(deleteFeed);
+  const refreshFn = useServerFn(refreshFeed);
+  const refreshAllFn = useServerFn(refreshAllFeeds);
+  const markFn = useServerFn(markItemsRead);
+  const markAllFn = useServerFn(markAllRead);
+
+  const feedsQuery = useQuery({
+    queryKey: ["feeds"],
+    queryFn: () => feedsFn(),
+    refetchInterval: 60_000,
+  });
+
+  const itemsQuery = useQuery({
+    queryKey: ["items", selected, unreadOnly],
+    queryFn: () =>
+      itemsFn({
+        data: {
+          feedId: selected === "__all__" ? null : selected,
+          unreadOnly,
+        },
+      }),
+    refetchInterval: 60_000,
+  });
+
+  useEffect(() => {
+    setChecked({});
+  }, [selected, unreadOnly]);
+
+  // Close the mobile sidebar drawer whenever a feed is picked
+  useEffect(() => {
+    setSidebarOpen(false);
+  }, [selected]);
+
+  // Auto-refresh all feeds every 5 minutes on the client too
+  useEffect(() => {
+    const id = window.setInterval(
+      () => {
+        refreshAllFn({}).then(() => {
+          qc.invalidateQueries({ queryKey: ["feeds"] });
+          qc.invalidateQueries({ queryKey: ["items"] });
+        }).catch(() => {});
+      },
+      5 * 60 * 1000,
+    );
+    return () => window.clearInterval(id);
+  }, [refreshAllFn, qc]);
+
+  const addMut = useMutation({
+    mutationFn: (url: string) => addFn({ data: { url } }),
+    onSuccess: () => {
+      toast.success("Feed added");
+      setNewUrl("");
+      setAddOpen(false);
+      qc.invalidateQueries({ queryKey: ["feeds"] });
+      qc.invalidateQueries({ queryKey: ["items"] });
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
+
+  const refreshMut = useMutation({
+    mutationFn: async (id?: string) => {
+      if (id) await refreshFn({ data: { id } });
+      else await refreshAllFn({});
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["feeds"] });
+      qc.invalidateQueries({ queryKey: ["items"] });
+    },
+  });
+
+  const delMut = useMutation({
+    mutationFn: (id: string) => delFn({ data: { id } }),
+    onSuccess: () => {
+      setSelected("__all__");
+      qc.invalidateQueries({ queryKey: ["feeds"] });
+      qc.invalidateQueries({ queryKey: ["items"] });
+    },
+  });
+
+  const markMut = useMutation({
+    mutationFn: (v: { ids: string[]; read: boolean }) => markFn({ data: v }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["feeds"] });
+      qc.invalidateQueries({ queryKey: ["items"] });
+      setChecked({});
+    },
+  });
+
+  const markAllMut = useMutation({
+    mutationFn: (feedId: string | null) => markAllFn({ data: { feedId } }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["feeds"] });
+      qc.invalidateQueries({ queryKey: ["items"] });
+    },
+  });
+
+  const items = itemsQuery.data ?? [];
+  const feeds: FeedRow[] = feedsQuery.data ?? [];
+  const totalUnread = useMemo(
+    () => feeds.reduce((s, f) => s + (f.unread_count ?? 0), 0),
+    [feeds],
+  );
+
+  const selectedFeed =
+    selected === "__all__" ? null : feeds.find((f) => f.id === selected);
+
+  const checkedIds = Object.keys(checked).filter((k) => checked[k]);
+  const allChecked = items.length > 0 && checkedIds.length === items.length;
+
+  async function signOut() {
+    await supabase.auth.signOut();
+    navigate({ to: "/auth" });
+  }
+
+  function toggleRow(id: string, next?: boolean) {
+    setChecked((prev) => ({ ...prev, [id]: next ?? !prev[id] }));
+  }
+
+  // "Mark above as read" / "Mark below as read": relative to the item's
+  // position in the currently displayed (already sorted) list.
+  function markRelative(index: number, direction: "above" | "below") {
+    const ids =
+      direction === "above"
+        ? items.slice(0, index).map((it: any) => it.id)
+        : items.slice(index + 1).map((it: any) => it.id);
+    const unreadIds = ids.filter(
+      (id: string) => !items.find((it: any) => it.id === id)?.is_read,
+    );
+    if (unreadIds.length === 0) {
+      toast.info(
+        direction === "above" ? "Nothing above to mark" : "Nothing below to mark",
+      );
+      return;
+    }
+    markMut.mutate({ ids: unreadIds, read: true });
+  }
+
+  const sidebarContent = (
+    <div className="flex h-full flex-col">
+      <div className="flex items-center justify-between p-4">
+        <Link to="/" className="flex items-center gap-2">
+          <div className="flex h-8 w-8 items-center justify-center rounded-full bg-gradient-to-br from-primary to-accent text-primary-foreground">
+            <Wand2 className="h-4 w-4" />
+          </div>
+          <span className="font-display text-lg">Fae Feeds</span>
+        </Link>
+        <Button size="icon" variant="ghost" onClick={signOut} aria-label="Sign out">
+          <LogOut className="h-4 w-4" />
+        </Button>
+      </div>
+
+      <div className="px-3">
+        <Dialog open={addOpen} onOpenChange={setAddOpen}>
+          <DialogTrigger asChild>
+            <Button className="w-full" size="sm">
+              <Plus className="mr-2 h-4 w-4" />
+              Add feed
+            </Button>
+          </DialogTrigger>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle className="font-display text-2xl">
+                Enchant a new URL
+              </DialogTitle>
+            </DialogHeader>
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                try {
+                  new URL(newUrl);
+                } catch {
+                  toast.error("Add https:// to the beginning");
+                  return;
+                }
+                addMut.mutate(newUrl);
+              }}
+              className="space-y-3"
+            >
+              <Input
+                value={newUrl}
+                onChange={(e) => setNewUrl(e.target.value)}
+                placeholder="https://a-lovely-blog.example"
+                autoFocus
+              />
+              <DialogFooter>
+                <Button type="submit" disabled={addMut.isPending || !newUrl}>
+                  {addMut.isPending ? (
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  ) : (
+                    <Sparkles className="mr-2 h-4 w-4" />
+                  )}
+                  Cast feed
+                </Button>
+              </DialogFooter>
+            </form>
+          </DialogContent>
+        </Dialog>
+      </div>
+
+      <nav className="mt-4 flex-1 overflow-y-auto px-2 pb-4">
+        <button
+          onClick={() => setSelected("__all__")}
+          className={`group flex w-full items-center justify-between rounded-lg px-3 py-2 text-sm transition ${
+            selected === "__all__"
+              ? "bg-primary/15 text-foreground"
+              : "text-muted-foreground hover:bg-muted"
+          }`}
+        >
+          <span className="flex items-center gap-2">
+            <Inbox className="h-4 w-4" />
+            All feeds
+          </span>
+          {totalUnread > 0 && (
+            <span className="rounded-full bg-primary px-2 py-0.5 text-[10px] font-semibold text-primary-foreground">
+              {totalUnread}
+            </span>
+          )}
+        </button>
+
+        <div className="mt-4 mb-1 px-3 text-[10px] uppercase tracking-[0.15em] text-muted-foreground">
+          Feeds ({feeds.length})
+        </div>
+
+        {feedsQuery.isLoading ? (
+          <div className="p-3 text-xs text-muted-foreground">Loading…</div>
+        ) : feeds.length === 0 ? (
+          <div className="rounded-lg border border-dashed border-border p-3 text-center text-xs text-muted-foreground">
+            No feeds yet. Add one above.
+          </div>
+        ) : (
+          <ul className="space-y-0.5">
+            {feeds.map((f) => (
+              <li key={f.id} className="group flex items-stretch">
+                <button
+                  onClick={() => setSelected(f.id)}
+                  className={`flex flex-1 items-center justify-between gap-2 overflow-hidden rounded-l-lg px-3 py-2.5 text-left text-sm transition ${
+                    selected === f.id
+                      ? "bg-primary/15 text-foreground"
+                      : "text-muted-foreground hover:bg-muted"
+                  }`}
+                >
+                  <span className="flex min-w-0 items-center gap-2">
+                    <Rss className="h-3.5 w-3.5 shrink-0 text-primary/70" />
+                    <span className="truncate">{f.title || f.url}</span>
+                  </span>
+                  {(f.unread_count ?? 0) > 0 && (
+                    <span className="shrink-0 rounded-full bg-accent px-1.5 py-0.5 text-[10px] font-semibold text-accent-foreground">
+                      {f.unread_count}
+                    </span>
+                  )}
+                </button>
+                <button
+                  onClick={() => {
+                    if (confirm(`Delete "${f.title || f.url}"?`)) delMut.mutate(f.id);
+                  }}
+                  className="rounded-r-lg px-2 text-muted-foreground opacity-70 hover:text-destructive sm:opacity-0 sm:group-hover:opacity-100"
+                  aria-label="Delete"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </nav>
+
+      <div className="border-t border-border p-3 text-[10px] text-muted-foreground">
+        <Sparkles className="mr-1 inline h-3 w-3 text-primary sparkle" />
+        Auto-refreshes every 5 min
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="grid min-h-screen grid-cols-1 md:grid-cols-[260px_1fr]">
+      <Toaster richColors position="top-center" />
+
+      {/* Sidebar: static on desktop, a slide-over drawer on mobile */}
+      <aside className="hidden border-r border-border bg-card/40 backdrop-blur md:flex md:flex-col">
+        {sidebarContent}
+      </aside>
+      <Sheet open={sidebarOpen} onOpenChange={setSidebarOpen}>
+        <SheetContent side="left" className="w-[85vw] max-w-[300px] p-0 md:hidden">
+          {sidebarContent}
+        </SheetContent>
+      </Sheet>
+
+      {/* Main */}
+      <main className="flex min-h-screen min-w-0 flex-col">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border bg-card/40 p-3 backdrop-blur sm:p-4">
+          <div className="flex min-w-0 items-center gap-2">
+            <Button
+              size="icon"
+              variant="ghost"
+              className="shrink-0 md:hidden"
+              onClick={() => setSidebarOpen(true)}
+              aria-label="Open feeds menu"
+            >
+              <Menu className="h-5 w-5" />
+            </Button>
+            <div className="min-w-0">
+              <h1 className="truncate font-display text-xl sm:text-2xl">
+                {selected === "__all__" ? "All feeds" : selectedFeed?.title ?? "Feed"}
+              </h1>
+              <p className="truncate text-xs text-muted-foreground">
+                {items.length} items shown
+                {selectedFeed?.last_refreshed_at && (
+                  <>
+                    {" · updated "}
+                    {new Date(selectedFeed.last_refreshed_at).toLocaleTimeString()}
+                  </>
+                )}
+                {selectedFeed?.last_error && (
+                  <span className="ml-2 rounded bg-destructive/15 px-1.5 py-0.5 text-destructive">
+                    {selectedFeed.last_error}
+                  </span>
+                )}
+              </p>
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+              <Checkbox
+                checked={unreadOnly}
+                onCheckedChange={(v) => setUnreadOnly(!!v)}
+              />
+              Unread only
+            </label>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() =>
+                refreshMut.mutate(selected === "__all__" ? undefined : selected)
+              }
+              disabled={refreshMut.isPending}
+            >
+              <RefreshCw
+                className={`h-4 w-4 sm:mr-2 ${refreshMut.isPending ? "animate-spin" : ""}`}
+              />
+              <span className="hidden sm:inline">Refresh</span>
+            </Button>
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={() =>
+                markAllMut.mutate(selected === "__all__" ? null : selected)
+              }
+            >
+              <CheckCheck className="h-4 w-4 sm:mr-2" />
+              <span className="hidden sm:inline">Mark all read</span>
+            </Button>
+          </div>
+        </div>
+
+        {checkedIds.length > 0 && (
+          <div className="flex items-center justify-between border-b border-border bg-primary/5 px-3 py-2 text-sm sm:px-4">
+            <span>{checkedIds.length} selected</span>
+            <div className="flex gap-1 sm:gap-2">
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => markMut.mutate({ ids: checkedIds, read: true })}
+              >
+                <CircleCheck className="h-4 w-4 sm:mr-2" />
+                <span className="hidden sm:inline">Mark read</span>
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => markMut.mutate({ ids: checkedIds, read: false })}
+              >
+                <Circle className="h-4 w-4 sm:mr-2" />
+                <span className="hidden sm:inline">Mark unread</span>
+              </Button>
+            </div>
+          </div>
+        )}
+
+        <div className="flex-1 overflow-auto">
+          {itemsQuery.isLoading ? (
+            <div className="flex items-center justify-center p-12 text-muted-foreground">
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" /> Loading…
+            </div>
+          ) : items.length === 0 ? (
+            <div className="p-12 text-center text-sm text-muted-foreground">
+              {feeds.length === 0
+                ? "Add your first feed to start collecting articles."
+                : unreadOnly
+                  ? "All caught up ✦"
+                  : "No items yet — try refreshing."}
+            </div>
+          ) : (
+            <>
+              {/* Select-all row */}
+              <div className="flex items-center gap-3 border-b border-border px-3 py-2 sm:px-4">
+                <Checkbox
+                  checked={allChecked}
+                  onCheckedChange={(v) => {
+                    if (v) {
+                      const next: Record<string, boolean> = {};
+                      for (const it of items) next[it.id] = true;
+                      setChecked(next);
+                    } else setChecked({});
+                  }}
+                  aria-label="Select all"
+                />
+                <span className="text-xs text-muted-foreground">Select all</span>
+              </div>
+
+              <ul className="divide-y divide-border">
+                {items.map((it: any, index: number) => {
+                  const isRead = it.is_read;
+                  return (
+                    <li
+                      key={it.id}
+                      className={`flex items-start gap-2 px-3 py-3 sm:gap-3 sm:px-4 ${
+                        isRead ? "opacity-55" : ""
+                      }`}
+                    >
+                      <Checkbox
+                        className="mt-1 shrink-0"
+                        checked={!!checked[it.id]}
+                        onCheckedChange={(v) => toggleRow(it.id, !!v)}
+                        aria-label="Select item"
+                      />
+
+                      <a
+                        href={it.link}
+                        target="_blank"
+                        rel="noreferrer"
+                        onClick={() => {
+                          if (!isRead) markMut.mutate({ ids: [it.id], read: true });
+                        }}
+                        className="min-w-0 flex-1 hover:text-primary"
+                      >
+                        <div
+                          className={`flex items-start gap-1.5 text-sm ${
+                            isRead ? "font-normal" : "font-semibold"
+                          }`}
+                        >
+                          <span className="line-clamp-2">{it.title}</span>
+                          <ExternalLink className="mt-0.5 h-3 w-3 shrink-0 opacity-50" />
+                        </div>
+                        <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-muted-foreground">
+                          {selected === "__all__" && (
+                            <span
+                              onClick={(e) => {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                setSelected(it.feed_id);
+                              }}
+                              className="truncate hover:text-primary hover:underline"
+                            >
+                              {it.feeds?.title ?? "—"}
+                            </span>
+                          )}
+                          {selected === "__all__" && <span>·</span>}
+                          <span className="whitespace-nowrap">
+                            {new Date(it.pub_date ?? it.created_at).toLocaleDateString()}
+                          </span>
+                        </div>
+                      </a>
+
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <Button
+                            size="icon"
+                            variant="ghost"
+                            className="mt-0.5 h-7 w-7 shrink-0"
+                            aria-label="Item actions"
+                          >
+                            <MoreVertical className="h-4 w-4" />
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end">
+                          <DropdownMenuItem
+                            onClick={() =>
+                              markMut.mutate({ ids: [it.id], read: !isRead })
+                            }
+                          >
+                            {isRead ? (
+                              <Circle className="mr-2 h-4 w-4" />
+                            ) : (
+                              <CircleCheck className="mr-2 h-4 w-4" />
+                            )}
+                            Mark {isRead ? "unread" : "read"}
+                          </DropdownMenuItem>
+                          <DropdownMenuItem
+                            onClick={() => markRelative(index, "above")}
+                            disabled={index === 0}
+                          >
+                            <ArrowUpToLine className="mr-2 h-4 w-4" />
+                            Mark above as read
+                          </DropdownMenuItem>
+                          <DropdownMenuItem
+                            onClick={() => markRelative(index, "below")}
+                            disabled={index === items.length - 1}
+                          >
+                            <ArrowDownToLine className="mr-2 h-4 w-4" />
+                            Mark below as read
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    </li>
+                  );
+                })}
+              </ul>
+            </>
+          )}
+        </div>
+      </main>
+    </div>
+  );
+}
