@@ -4,7 +4,7 @@
 # Pages output to (commonly `dist` or `.output/public` depending on the
 # Nitro version) and update `pages_build_output_dir` below to match before
 # running `wrangler pages deploy`.
-name = "fae-feeds"
+name = "bug-free-umbrella"
 compatibility_date = "2026-07-01"
 compatibility_flags = ["nodejs_compat"]
 pages_build_output_dir = "dist"
