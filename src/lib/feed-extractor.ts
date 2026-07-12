@@ -447,6 +447,68 @@ function extractAnyLinkedItems(html: string, sourceUrl: string): FeedItem[] {
   return items;
 }
 
+/**
+ * Some sites render their article list entirely client-side (React/Vue/
+ * Next.js/Substack-style SPAs) — the static HTML we fetch is just an empty
+ * shell with no real links in it, which is why scraping can come up with
+ * nothing (or just the page's own meta tags as a single fake "item"). As a
+ * fallback we re-fetch through r.jina.ai's reader, which executes the page's
+ * JS before handing back content, and returns it as clean markdown rather
+ * than HTML — so it needs its own link extractor.
+ */
+async function fetchRenderedViaReader(url: string): Promise<string | null> {
+  try {
+    const res = await fetch(`https://r.jina.ai/${url}`, {
+      headers: { "User-Agent": BROWSER_HEADERS["User-Agent"], Accept: "text/plain,*/*" },
+    });
+    if (!res.ok) return null;
+    return await res.text();
+  } catch {
+    return null;
+  }
+}
+
+/** Extract `[title](url)` style links from the reader proxy's markdown
+ * output. Mirrors extractAnyLinkedItems' filtering, since a rendered SPA
+ * page still has nav/footer links mixed in with the real article ones. */
+function extractMarkdownLinkedItems(markdown: string, sourceUrl: string): FeedItem[] {
+  const origin = originOf(sourceUrl);
+  const items: FeedItem[] = [];
+  const seen = new Set<string>();
+
+  const linkRegex = /\[([^\]]{8,220})\]\((https?:\/\/[^\s)]+|\/[^\s)]+)\)/g;
+  let m: RegExpExecArray | null;
+  while ((m = linkRegex.exec(markdown)) !== null) {
+    // Skip markdown images: ![alt](url) — the "!" sits right before the "[".
+    if (m.index > 0 && markdown[m.index - 1] === "!") continue;
+
+    const rawTitle = m[1].trim();
+    const rawHref = m[2].trim();
+    if (!rawHref || rawHref.startsWith("#")) continue;
+
+    const href = absoluteUrl(rawHref, sourceUrl);
+    try {
+      const u = new URL(href);
+      if (origin && u.origin !== origin) continue;
+      if (isSkippableListingPath(u.pathname)) continue;
+      if (u.pathname === "/" || u.pathname === "" || u.href === sourceUrl) continue;
+    } catch {
+      continue;
+    }
+
+    const title = decodeEntities(rawTitle);
+    if (!title || title.length < 8 || title.length > 220) continue;
+    if (/^(image|img|logo|icon|photo)$/i.test(title)) continue;
+    if (seen.has(href)) continue;
+    seen.add(href);
+
+    items.push({ title, link: href, description: title, pubDate: undefined });
+    if (items.length >= 30) break;
+  }
+
+  return items;
+}
+
 function extractArticleAsItem(html: string, sourceUrl: string): FeedItem {
   const title =
     extractMeta(html, "og:title") ||
@@ -507,7 +569,18 @@ export async function extractFeed(sourceUrl: string): Promise<ExtractedFeed> {
   // only fall back to a flat link scan if the page doesn't use headings for
   // its post titles at all.
   const headingItems = extractHeadingLinkedItems(html, sourceUrl);
-  const items = headingItems.length >= 3 ? headingItems : extractAnyLinkedItems(html, sourceUrl);
+  let items = headingItems.length >= 3 ? headingItems : extractAnyLinkedItems(html, sourceUrl);
+
+  // If that came up (almost) empty, the page is likely client-rendered and
+  // the static HTML we fetched never had the article list in it to begin
+  // with. Retry through a proxy that executes the page's JS first.
+  if (items.length < 2) {
+    const rendered = await fetchRenderedViaReader(sourceUrl);
+    if (rendered) {
+      const renderedItems = extractMarkdownLinkedItems(rendered, sourceUrl);
+      if (renderedItems.length > items.length) items = renderedItems;
+    }
+  }
 
   // 4. Newsletter / single-article fallback — treat the page itself as one item
   if (items.length === 0) {
