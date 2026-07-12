@@ -754,7 +754,7 @@ function Reader() {
               <Input
                 value={itemSearchInput}
                 onChange={(e) => setItemSearchInput(e.target.value)}
-                placeholder="Search articles…"
+                placeholder="Search titles…"
                 className="h-8 w-36 pl-8 pr-7 text-xs sm:w-52"
               />
               {itemSearchInput && (

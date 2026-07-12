@@ -323,6 +323,130 @@ function discoverFeedLink(html: string, sourceUrl: string): string | undefined {
   return undefined;
 }
 
+function originOf(sourceUrl: string): string {
+  try {
+    return new URL(sourceUrl).origin;
+  } catch {
+    return "";
+  }
+}
+
+function isSkippableListingPath(pathname: string): boolean {
+  return /\/(tag|category|author|page|search|login|signup|about|contact|privacy|terms)(\/|$)/i.test(
+    pathname,
+  );
+}
+
+/**
+ * Listing/index pages almost always wrap each article's title in a heading
+ * tag (h1–h4) that links to the article — this is exactly the "item +
+ * heading + link" structure that tools like rsspls ask a person to specify
+ * by hand with CSS selectors (see https://github.com/wezm/rsspls). We get
+ * the same precision without per-site config by scanning for that pattern
+ * directly: it reliably separates real article titles from nav/footer/
+ * category links, which a flat scan of every `<a>` tag cannot do.
+ *
+ * For each match we also look at a short window of HTML right after the
+ * heading — where listing pages conventionally place the date and a teaser
+ * paragraph — to fill in `pubDate` and `description` when possible.
+ */
+function extractHeadingLinkedItems(html: string, sourceUrl: string): FeedItem[] {
+  const origin = originOf(sourceUrl);
+  const items: FeedItem[] = [];
+  const seen = new Set<string>();
+
+  const headingRegex = /<h[1-4]\b[^>]*>([\s\S]*?)<\/h[1-4]>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = headingRegex.exec(html)) !== null) {
+    const headingInner = m[1];
+    const anchorMatch = headingInner.match(
+      /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/i,
+    );
+    if (!anchorMatch) continue;
+
+    const rawHref = anchorMatch[1];
+    if (!rawHref || rawHref.startsWith("#") || rawHref.startsWith("javascript:")) continue;
+    const href = absoluteUrl(rawHref, sourceUrl);
+    try {
+      const u = new URL(href);
+      if (origin && u.origin !== origin) continue;
+      if (isSkippableListingPath(u.pathname)) continue;
+      if (u.pathname === "/" || u.pathname === "" || u.href === sourceUrl) continue;
+    } catch {
+      continue;
+    }
+
+    const title = stripTags(anchorMatch[2]) || stripTags(headingInner);
+    if (!title || title.length < 4 || title.length > 220) continue;
+    if (seen.has(href)) continue;
+    seen.add(href);
+
+    // Look just past the heading for a date and teaser paragraph, the way
+    // rsspls's `date` / `summary` selectors do relative to its `item`.
+    const windowEnd = Math.min(html.length, headingRegex.lastIndex + 1500);
+    const after = html.slice(headingRegex.lastIndex, windowEnd);
+
+    let pubDate: string | undefined;
+    const timeDatetime = after.match(/<time\b[^>]*\bdatetime=["']([^"']+)["']/i);
+    const timeText = after.match(/<time\b[^>]*>([\s\S]*?)<\/time>/i);
+    const rawDate = timeDatetime?.[1] ?? (timeText ? stripTags(timeText[1]) : undefined);
+    if (rawDate) {
+      const d = new Date(rawDate.trim());
+      if (!Number.isNaN(d.getTime())) pubDate = d.toUTCString();
+    }
+
+    const pMatch = after.match(/<p\b[^>]*>([\s\S]*?)<\/p>/i);
+    const description = (pMatch ? stripTags(pMatch[1]) : "") || title;
+
+    items.push({ title, link: href, description, pubDate });
+    if (items.length >= 30) break;
+  }
+
+  return items;
+}
+
+/** Last-resort fallback: scan every `<a>` on the page. Much noisier than
+ * heading-based extraction (nav/footer links slip through), so it's only
+ * used when the page doesn't wrap article titles in headings at all. */
+function extractAnyLinkedItems(html: string, sourceUrl: string): FeedItem[] {
+  const origin = originOf(sourceUrl);
+  const linkRegex = /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  const seen = new Set<string>();
+  const items: FeedItem[] = [];
+
+  let m: RegExpExecArray | null;
+  while ((m = linkRegex.exec(html)) !== null) {
+    const rawHref = m[1];
+    const fullTag = m[0];
+    const inner = m[2];
+    if (!rawHref || rawHref.startsWith("#") || rawHref.startsWith("javascript:")) continue;
+
+    const href = absoluteUrl(rawHref, sourceUrl);
+    try {
+      const u = new URL(href);
+      if (origin && u.origin !== origin) continue;
+      if (isSkippableListingPath(u.pathname)) continue;
+      if (u.pathname === "/" || u.pathname === "") continue;
+      if (u.href === sourceUrl) continue;
+    } catch {
+      continue;
+    }
+
+    const attrTitle =
+      fullTag.match(/\btitle=["']([^"']+)["']/i)?.[1] ||
+      fullTag.match(/\baria-label=["']([^"']+)["']/i)?.[1];
+    const title = decodeEntities(attrTitle?.trim() || "") || stripTags(inner);
+    if (!title || title.length < 15 || title.length > 220) continue;
+    if (seen.has(href)) continue;
+    seen.add(href);
+
+    items.push({ title, link: href, description: title, pubDate: undefined });
+    if (items.length >= 30) break;
+  }
+
+  return items;
+}
+
 function extractArticleAsItem(html: string, sourceUrl: string): FeedItem {
   const title =
     extractMeta(html, "og:title") ||
@@ -377,54 +501,13 @@ export async function extractFeed(sourceUrl: string): Promise<ExtractedFeed> {
     extractMeta(html, "description") ||
     `Auto-generated RSS feed for ${sourceUrl}`;
 
-  // 3. Try to scrape article links from a listing/index page
-  const linkRegex = /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
-  const seen = new Set<string>();
-  const items: FeedItem[] = [];
-
-  const origin = (() => {
-    try {
-      return new URL(sourceUrl).origin;
-    } catch {
-      return "";
-    }
-  })();
-
-  let m: RegExpExecArray | null;
-  while ((m = linkRegex.exec(html)) !== null) {
-    const rawHref = m[1];
-    const fullTag = m[0];
-    const inner = m[2];
-    if (!rawHref || rawHref.startsWith("#") || rawHref.startsWith("javascript:")) continue;
-
-    const href = absoluteUrl(rawHref, sourceUrl);
-    try {
-      const u = new URL(href);
-      if (origin && u.origin !== origin) continue;
-      if (/\/(tag|category|author|page|search|login|signup|about|contact|privacy|terms)(\/|$)/i.test(u.pathname)) continue;
-      if (u.pathname === "/" || u.pathname === "") continue;
-      if (u.href === sourceUrl) continue;
-    } catch {
-      continue;
-    }
-
-    const attrTitle =
-      fullTag.match(/\btitle=["']([^"']+)["']/i)?.[1] ||
-      fullTag.match(/\baria-label=["']([^"']+)["']/i)?.[1];
-    const title = decodeEntities(attrTitle?.trim() || "") || stripTags(inner);
-    if (!title || title.length < 15 || title.length > 220) continue;
-    if (seen.has(href)) continue;
-    seen.add(href);
-
-    items.push({
-      title,
-      link: href,
-      description: title,
-      pubDate: new Date().toUTCString(),
-    });
-
-    if (items.length >= 30) break;
-  }
+  // 3. Scrape article links from a listing/index page. Prefer titles that
+  // are wrapped in heading tags (the pattern real blog listings use) since
+  // it's far more precise than treating every link on the page as an item;
+  // only fall back to a flat link scan if the page doesn't use headings for
+  // its post titles at all.
+  const headingItems = extractHeadingLinkedItems(html, sourceUrl);
+  const items = headingItems.length >= 3 ? headingItems : extractAnyLinkedItems(html, sourceUrl);
 
   // 4. Newsletter / single-article fallback — treat the page itself as one item
   if (items.length === 0) {

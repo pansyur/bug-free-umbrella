@@ -258,7 +258,7 @@ export const listItems = createServerFn({ method: "POST" })
       // Escape ilike wildcards so a literal "%" or "_" in a search doesn't
       // behave like a wildcard.
       const escaped = term.replace(/[%_]/g, (c) => `\\${c}`);
-      q = q.or(`title.ilike.%${escaped}%,description.ilike.%${escaped}%`);
+      q = q.ilike("title", `%${escaped}%`);
     }
     const { data: items, error } = await q;
     if (error) throw new Error(error.message);
