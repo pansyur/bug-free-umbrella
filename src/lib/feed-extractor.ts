@@ -146,7 +146,42 @@ async function fetchWithBypass(url: string): Promise<string> {
   );
 }
 
-function extractMeta(html: string, prop: string): string | undefined {
+/**
+ * Fetch a URL we expect to be real RSS/Atom XML (a discovered feed link, or
+ * a known aggregator's feed endpoint). Uses the same direct-then-proxy
+ * strategy as fetchWithBypass, but only ever proxies through raw
+ * pass-through services — never r.jina.ai, which "reader-ifies" pages into
+ * markdown and will mangle XML into something that no longer parses.
+ */
+async function fetchXmlWithBypass(url: string): Promise<string> {
+  const direct = await tryFetchDirect(url);
+  if (direct.text !== undefined) return direct.text;
+
+  if (direct.status !== undefined && ![403, 429, 503].includes(direct.status)) {
+    throw new Error(`That feed returned a ${direct.status}.`);
+  }
+
+  const proxies = [
+    `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+    `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
+  ];
+
+  const failures: string[] = direct.status ? [`direct request: ${direct.status}`] : [];
+  for (const proxyUrl of proxies) {
+    try {
+      return await tryFetchProxy(proxyUrl);
+    } catch (e) {
+      failures.push(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  throw new Error(
+    `Couldn't fetch that feed after retrying (${failures.join("; ")}). It may be blocking ` +
+      `requests from this server specifically — try again later.`,
+  );
+}
+
+
   const patterns = [
     new RegExp(
       `<meta[^>]+(?:property|name)=["']${prop}["'][^>]*content=["']([^"']+)["']`,
@@ -534,7 +569,62 @@ function extractArticleAsItem(html: string, sourceUrl: string): FeedItem {
   };
 }
 
+/**
+ * Google News is a heavy client-rendered SPA that also actively blocks
+ * scrapers and rendering proxies, so no amount of HTML/JS scraping is going
+ * to work reliably there. It does, however, still publish real RSS feeds —
+ * they're just not linked from the page for auto-discovery to find. Google
+ * News mirrors every browsable path (home, search, topics, publications...)
+ * under a parallel /rss/ path with the same query string, so we can route
+ * straight to the actual feed instead of trying to scrape the SPA.
+ */
+function rewriteKnownAggregatorUrl(sourceUrl: string): string | null {
+  let u: URL;
+  try {
+    u = new URL(sourceUrl);
+  } catch {
+    return null;
+  }
+
+  if (u.hostname === "news.google.com") {
+    if (u.pathname.startsWith("/rss")) return null; // already an RSS URL
+    const path = u.pathname === "/" ? "" : u.pathname;
+    const rssUrl = new URL(`https://news.google.com/rss${path}`);
+    rssUrl.search = u.search;
+    if (!rssUrl.searchParams.has("hl")) rssUrl.searchParams.set("hl", "en-US");
+    if (!rssUrl.searchParams.has("gl")) rssUrl.searchParams.set("gl", "US");
+    if (!rssUrl.searchParams.has("ceid")) rssUrl.searchParams.set("ceid", "US:en");
+    return rssUrl.toString();
+  }
+
+  return null;
+}
+
 export async function extractFeed(sourceUrl: string): Promise<ExtractedFeed> {
+  // 0. Known aggregators that hide a real feed behind a SPA — go straight
+  // to the feed instead of trying (and failing) to scrape the page.
+  const rewritten = rewriteKnownAggregatorUrl(sourceUrl);
+  if (rewritten) {
+    try {
+      const feedXml = await fetchXmlWithBypass(rewritten);
+      const parsed = tryParseXmlFeed(feedXml, rewritten);
+      // Keep `link` pointing at the page the person actually gave us.
+      if (parsed) return { ...parsed, link: sourceUrl };
+      throw new Error("didn't get back a parseable RSS document (likely a consent/CAPTCHA page)");
+    } catch (e) {
+      // Don't fall through to scraping the SPA here — that just produces a
+      // misleading single fake "item" (the page's own title/description).
+      // Google actively blocks a lot of server/hosting-provider traffic to
+      // news.google.com regardless of retries, so surface that plainly.
+      const reason = e instanceof Error ? e.message : String(e);
+      throw new Error(
+        `Google News blocked the request (${reason}). This is Google blocking the request at ` +
+          `their end, not something retrying fixes — try opening ${rewritten} directly in your ` +
+          `own browser to confirm it loads, then paste that exact RSS URL instead of the news.google.com page.`,
+      );
+    }
+  }
+
   const html = await fetchWithBypass(sourceUrl);
 
   // 1. Real RSS/Atom XML feed
@@ -545,7 +635,7 @@ export async function extractFeed(sourceUrl: string): Promise<ExtractedFeed> {
   const discovered = discoverFeedLink(html, sourceUrl);
   if (discovered && discovered !== sourceUrl) {
     try {
-      const feedXml = await fetchWithBypass(discovered);
+      const feedXml = await fetchXmlWithBypass(discovered);
       const parsed = tryParseXmlFeed(feedXml, discovered);
       if (parsed) return parsed;
     } catch {
