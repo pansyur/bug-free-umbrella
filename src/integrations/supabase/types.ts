@@ -21,6 +21,7 @@ export type Database = {
           feed_id: string
           fetched_at: string
           id: string
+          is_deleted: boolean
           is_read: boolean
           link: string
           pub_date: string | null
@@ -33,6 +34,7 @@ export type Database = {
           feed_id: string
           fetched_at?: string
           id?: string
+          is_deleted?: boolean
           is_read?: boolean
           link: string
           pub_date?: string | null
@@ -45,6 +47,7 @@ export type Database = {
           feed_id?: string
           fetched_at?: string
           id?: string
+          is_deleted?: boolean
           is_read?: boolean
           link?: string
           pub_date?: string | null
@@ -66,6 +69,7 @@ export type Database = {
           created_at: string
           description: string | null
           id: string
+          item_path_prefix: string | null
           last_error: string | null
           last_refreshed_at: string | null
           title: string
@@ -76,6 +80,7 @@ export type Database = {
           created_at?: string
           description?: string | null
           id?: string
+          item_path_prefix?: string | null
           last_error?: string | null
           last_refreshed_at?: string | null
           title: string
@@ -86,6 +91,7 @@ export type Database = {
           created_at?: string
           description?: string | null
           id?: string
+          item_path_prefix?: string | null
           last_error?: string | null
           last_refreshed_at?: string | null
           title?: string

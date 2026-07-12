@@ -3,7 +3,6 @@ import { useEffect, useState } from "react";
 import { toast, Toaster } from "sonner";
 import { Wand2, Sparkles, Loader2 } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
-import { lovable } from "@/integrations/lovable";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card } from "@/components/ui/card";
@@ -58,15 +57,15 @@ function AuthPage() {
   async function google() {
     setBusy(true);
     try {
-      const result = await lovable.auth.signInWithOAuth("google", {
-        redirect_uri: window.location.origin,
+      const { error } = await supabase.auth.signInWithOAuth({
+        provider: "google",
+        options: { redirectTo: `${window.location.origin}/reader` },
       });
-      if (result.error) throw result.error;
-      if (result.redirected) return;
-      navigate({ to: "/reader" });
+      if (error) throw error;
+      // Supabase redirects the browser to Google, so there's nothing more
+      // to do here — navigate() would never run before the redirect fires.
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "Google sign-in failed");
-    } finally {
       setBusy(false);
     }
   }

@@ -1,0 +1,18 @@
+# Cloudflare Pages configuration.
+#
+# After `bun run build`, check what directory Nitro actually writes the
+# Pages output to (commonly `dist` or `.output/public` depending on the
+# Nitro version) and update `pages_build_output_dir` below to match before
+# running `wrangler pages deploy`.
+name = "fae-feeds"
+compatibility_date = "2026-07-01"
+compatibility_flags = ["nodejs_compat"]
+pages_build_output_dir = "dist"
+
+# Server-side env vars (Supabase, etc.) are set as Cloudflare Pages
+# secrets/environment variables in the dashboard, or via:
+#   wrangler pages secret put SUPABASE_URL
+#   wrangler pages secret put SUPABASE_PUBLISHABLE_KEY
+#   wrangler pages secret put SUPABASE_SERVICE_ROLE_KEY
+# VITE_-prefixed vars must be set as build-time environment variables in the
+# Pages project settings, since Vite inlines them at build time.

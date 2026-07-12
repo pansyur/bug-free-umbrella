@@ -10,7 +10,6 @@ import {
 import { useEffect, type ReactNode } from "react";
 
 import appCss from "../styles.css?url";
-import { reportLovableError } from "../lib/lovable-error-reporting";
 
 function NotFoundComponent() {
   return (
@@ -35,10 +34,9 @@ function NotFoundComponent() {
 }
 
 function ErrorComponent({ error, reset }: { error: Error; reset: () => void }) {
-  console.error(error);
   const router = useRouter();
   useEffect(() => {
-    reportLovableError(error, { boundary: "tanstack_root_error_component" });
+    console.error("[root error boundary]", error);
   }, [error]);
 
   return (
@@ -77,18 +75,14 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
     meta: [
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1" },
-      { title: "FeedForge — Turn any website into an RSS feed" },
-      { name: "description", content: "Generate an RSS feed from any URL. Bypasses CORS and common Cloudflare blocks. Save your feeds for later." },
-      { name: "author", content: "Lovable" },
-      { property: "og:title", content: "FeedForge — Turn any website into an RSS feed" },
-      { property: "og:description", content: "Generate an RSS feed from any URL. Bypasses CORS and common Cloudflare blocks. Save your feeds for later." },
+      { title: "Fae Feeds — enchant any website into an RSS feed" },
+      { name: "description", content: "A whimsical little scriptorium that turns any URL into a subscribable RSS feed. Auto-refreshes every 5 minutes, works offline from cache." },
+      { property: "og:title", content: "Fae Feeds — enchant any website into an RSS feed" },
+      { property: "og:description", content: "A whimsical little scriptorium that turns any URL into a subscribable RSS feed. Auto-refreshes every 5 minutes, works offline from cache." },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary_large_image" },
-      { name: "twitter:site", content: "@Lovable" },
-      { name: "twitter:title", content: "FeedForge — Turn any website into an RSS feed" },
-      { name: "twitter:description", content: "Generate an RSS feed from any URL. Bypasses CORS and common Cloudflare blocks. Save your feeds for later." },
-      { property: "og:image", content: "https://pub-bb2e103a32db4e198524a2e9ed8f35b4.r2.dev/d18d7cbe-bea8-46fa-a079-7e0994739a2d/id-preview-336125e8--82aea2ae-d816-41c0-adaa-40fc8b6c0119.lovable.app-1783528226256.png" },
-      { name: "twitter:image", content: "https://pub-bb2e103a32db4e198524a2e9ed8f35b4.r2.dev/d18d7cbe-bea8-46fa-a079-7e0994739a2d/id-preview-336125e8--82aea2ae-d816-41c0-adaa-40fc8b6c0119.lovable.app-1783528226256.png" },
+      { name: "twitter:title", content: "Fae Feeds — enchant any website into an RSS feed" },
+      { name: "twitter:description", content: "A whimsical little scriptorium that turns any URL into a subscribable RSS feed. Auto-refreshes every 5 minutes, works offline from cache." },
     ],
     links: [
       { rel: "stylesheet", href: appCss },

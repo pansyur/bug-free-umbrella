@@ -21,6 +21,7 @@ import {
   MoreVertical,
   ArrowUpToLine,
   ArrowDownToLine,
+  ChevronLeft,
 } from "lucide-react";
 
 import { supabase } from "@/integrations/supabase/client";
@@ -40,18 +41,23 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import {
   addFeed,
   deleteFeed,
+  deleteItems,
+  deleteReadItems,
   listFeeds,
   listItems,
   markAllRead,
   markItemsRead,
+  previewFeedSetup,
   refreshAllFeeds,
   refreshFeed,
 } from "@/lib/reader.functions";
+import type { ExtractedFeed } from "@/lib/feed-extractor";
 
 export const Route = createFileRoute("/_authenticated/reader")({
   head: () => ({
@@ -73,20 +79,43 @@ type FeedRow = {
   last_error?: string | null;
 };
 
+const UNREAD_ONLY_KEY = "faefeeds.unreadOnly.v1";
+
 function Reader() {
   const navigate = useNavigate();
   const qc = useQueryClient();
   const [selected, setSelected] = useState<SelKey>("__all__");
-  const [unreadOnly, setUnreadOnly] = useState(false);
+  // Persisted so the "Unread only" filter stays checked across reloads
+  // until the person explicitly unchecks it.
+  const [unreadOnly, setUnreadOnly] = useState(() => {
+    if (typeof window === "undefined") return false;
+    return window.localStorage.getItem(UNREAD_ONLY_KEY) === "1";
+  });
   const [addOpen, setAddOpen] = useState(false);
   const [newUrl, setNewUrl] = useState("");
   const [checked, setChecked] = useState<Record<string, boolean>>({});
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
+  // "Add feed" setup flow: for a genuine RSS/Atom URL we add it right away;
+  // for a scraped HTML page we show a checklist so the person can confirm
+  // which links are actually articles first.
+  const [setupFeed, setSetupFeed] = useState<ExtractedFeed | null>(null);
+  const [setupSelected, setSetupSelected] = useState<Record<string, boolean>>({});
+
+  function setUnreadOnlyPersisted(v: boolean) {
+    setUnreadOnly(v);
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(UNREAD_ONLY_KEY, v ? "1" : "0");
+    }
+  }
+
   const feedsFn = useServerFn(listFeeds);
   const itemsFn = useServerFn(listItems);
   const addFn = useServerFn(addFeed);
+  const previewSetupFn = useServerFn(previewFeedSetup);
   const delFn = useServerFn(deleteFeed);
+  const delItemsFn = useServerFn(deleteItems);
+  const delReadFn = useServerFn(deleteReadItems);
   const refreshFn = useServerFn(refreshFeed);
   const refreshAllFn = useServerFn(refreshAllFeeds);
   const markFn = useServerFn(markItemsRead);
@@ -133,12 +162,55 @@ function Reader() {
     return () => window.clearInterval(id);
   }, [refreshAllFn, qc]);
 
+  // Step 1: fetch + inspect the URL. Real RSS/Atom feeds go straight to
+  // addMut; scraped HTML pages populate setupFeed so the person can pick
+  // which links are real articles.
+  const previewMut = useMutation({
+    mutationFn: (url: string) => previewSetupFn({ data: { url } }),
+    onSuccess: (extracted, url) => {
+      if (extracted.isRealFeed) {
+        addMut.mutate({ url });
+        return;
+      }
+      setSetupFeed(extracted);
+      const initial: Record<string, boolean> = {};
+      for (const it of extracted.items) initial[it.link] = true;
+      setSetupSelected(initial);
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
+
   const addMut = useMutation({
-    mutationFn: (url: string) => addFn({ data: { url } }),
+    mutationFn: (v: { url: string; selectedLinks?: string[] }) => addFn({ data: v }),
     onSuccess: () => {
       toast.success("Feed added");
       setNewUrl("");
       setAddOpen(false);
+      setSetupFeed(null);
+      setSetupSelected({});
+      qc.invalidateQueries({ queryKey: ["feeds"] });
+      qc.invalidateQueries({ queryKey: ["items"] });
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
+
+  const delItemsMut = useMutation({
+    mutationFn: (ids: string[]) => delItemsFn({ data: { ids } }),
+    onSuccess: () => {
+      toast.success("Deleted");
+      qc.invalidateQueries({ queryKey: ["feeds"] });
+      qc.invalidateQueries({ queryKey: ["items"] });
+      setChecked({});
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
+
+  const delReadMut = useMutation({
+    mutationFn: (feedId: string | null) => delReadFn({ data: { feedId } }),
+    onSuccess: (res) => {
+      toast.success(
+        res.deleted > 0 ? `Deleted ${res.deleted} read item(s)` : "Nothing to delete",
+      );
       qc.invalidateQueries({ queryKey: ["feeds"] });
       qc.invalidateQueries({ queryKey: ["items"] });
     },
@@ -238,49 +310,149 @@ function Reader() {
       </div>
 
       <div className="px-3">
-        <Dialog open={addOpen} onOpenChange={setAddOpen}>
+        <Dialog
+          open={addOpen}
+          onOpenChange={(open) => {
+            setAddOpen(open);
+            if (!open) {
+              setSetupFeed(null);
+              setSetupSelected({});
+              setNewUrl("");
+            }
+          }}
+        >
           <DialogTrigger asChild>
             <Button className="w-full" size="sm">
               <Plus className="mr-2 h-4 w-4" />
               Add feed
             </Button>
           </DialogTrigger>
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle className="font-display text-2xl">
-                Enchant a new URL
-              </DialogTitle>
-            </DialogHeader>
-            <form
-              onSubmit={(e) => {
-                e.preventDefault();
-                try {
-                  new URL(newUrl);
-                } catch {
-                  toast.error("Add https:// to the beginning");
-                  return;
-                }
-                addMut.mutate(newUrl);
-              }}
-              className="space-y-3"
-            >
-              <Input
-                value={newUrl}
-                onChange={(e) => setNewUrl(e.target.value)}
-                placeholder="https://a-lovely-blog.example"
-                autoFocus
-              />
-              <DialogFooter>
-                <Button type="submit" disabled={addMut.isPending || !newUrl}>
-                  {addMut.isPending ? (
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+          <DialogContent className={setupFeed ? "sm:max-w-lg" : undefined}>
+            {!setupFeed ? (
+              <>
+                <DialogHeader>
+                  <DialogTitle className="font-display text-2xl">
+                    Enchant a new URL
+                  </DialogTitle>
+                </DialogHeader>
+                <form
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    try {
+                      new URL(newUrl);
+                    } catch {
+                      toast.error("Add https:// to the beginning");
+                      return;
+                    }
+                    previewMut.mutate(newUrl);
+                  }}
+                  className="space-y-3"
+                >
+                  <Input
+                    value={newUrl}
+                    onChange={(e) => setNewUrl(e.target.value)}
+                    placeholder="https://a-lovely-blog.example"
+                    autoFocus
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    If this isn't a real RSS/Atom feed, we'll scan the page and let
+                    you confirm which links are actual articles.
+                  </p>
+                  <DialogFooter>
+                    <Button
+                      type="submit"
+                      disabled={previewMut.isPending || addMut.isPending || !newUrl}
+                    >
+                      {previewMut.isPending || addMut.isPending ? (
+                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      ) : (
+                        <Sparkles className="mr-2 h-4 w-4" />
+                      )}
+                      Cast feed
+                    </Button>
+                  </DialogFooter>
+                </form>
+              </>
+            ) : (
+              <>
+                <DialogHeader>
+                  <DialogTitle className="flex items-center gap-2 font-display text-2xl">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSetupFeed(null);
+                        setSetupSelected({});
+                      }}
+                      className="rounded p-1 text-muted-foreground hover:bg-muted"
+                      aria-label="Back"
+                    >
+                      <ChevronLeft className="h-5 w-5" />
+                    </button>
+                    Confirm the articles
+                  </DialogTitle>
+                </DialogHeader>
+                <p className="text-sm text-muted-foreground">
+                  <span className="font-medium text-foreground">{setupFeed.title}</span>{" "}
+                  isn't a real RSS feed, so we scraped its links. Uncheck anything
+                  that isn't an article — we'll remember the pattern for future
+                  refreshes.
+                </p>
+                <div className="max-h-72 space-y-1 overflow-y-auto rounded-md border border-border p-2">
+                  {setupFeed.items.length === 0 ? (
+                    <p className="p-3 text-center text-xs text-muted-foreground">
+                      No article-like links found on that page.
+                    </p>
                   ) : (
-                    <Sparkles className="mr-2 h-4 w-4" />
+                    setupFeed.items.map((it) => (
+                      <label
+                        key={it.link}
+                        className="flex items-start gap-2 rounded px-2 py-1.5 text-sm hover:bg-muted"
+                      >
+                        <Checkbox
+                          className="mt-0.5"
+                          checked={!!setupSelected[it.link]}
+                          onCheckedChange={(v) =>
+                            setSetupSelected((prev) => ({ ...prev, [it.link]: !!v }))
+                          }
+                        />
+                        <span className="min-w-0 flex-1">
+                          <span className="line-clamp-2 block">{it.title}</span>
+                          <span className="block truncate text-xs text-muted-foreground">
+                            {it.link}
+                          </span>
+                        </span>
+                      </label>
+                    ))
                   )}
-                  Cast feed
-                </Button>
-              </DialogFooter>
-            </form>
+                </div>
+                <DialogFooter>
+                  <span className="mr-auto text-xs text-muted-foreground">
+                    {Object.values(setupSelected).filter(Boolean).length} selected
+                  </span>
+                  <Button
+                    onClick={() =>
+                      addMut.mutate({
+                        url: newUrl,
+                        selectedLinks: Object.keys(setupSelected).filter(
+                          (k) => setupSelected[k],
+                        ),
+                      })
+                    }
+                    disabled={
+                      addMut.isPending ||
+                      Object.values(setupSelected).filter(Boolean).length === 0
+                    }
+                  >
+                    {addMut.isPending ? (
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    ) : (
+                      <Sparkles className="mr-2 h-4 w-4" />
+                    )}
+                    Add feed
+                  </Button>
+                </DialogFooter>
+              </>
+            )}
           </DialogContent>
         </Dialog>
       </div>
@@ -410,7 +582,7 @@ function Reader() {
             <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
               <Checkbox
                 checked={unreadOnly}
-                onCheckedChange={(v) => setUnreadOnly(!!v)}
+                onCheckedChange={(v) => setUnreadOnlyPersisted(!!v)}
               />
               Unread only
             </label>
@@ -437,6 +609,25 @@ function Reader() {
               <CheckCheck className="h-4 w-4 sm:mr-2" />
               <span className="hidden sm:inline">Mark all read</span>
             </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => {
+                if (
+                  confirm(
+                    "Delete every already-read item" +
+                      (selected === "__all__" ? "" : " in this feed") +
+                      "? They won't come back next refresh.",
+                  )
+                ) {
+                  delReadMut.mutate(selected === "__all__" ? null : selected);
+                }
+              }}
+              disabled={delReadMut.isPending}
+            >
+              <Trash2 className="h-4 w-4 sm:mr-2" />
+              <span className="hidden sm:inline">Delete read</span>
+            </Button>
           </div>
         </div>
 
@@ -459,6 +650,19 @@ function Reader() {
               >
                 <Circle className="h-4 w-4 sm:mr-2" />
                 <span className="hidden sm:inline">Mark unread</span>
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                className="text-destructive hover:text-destructive"
+                onClick={() => {
+                  if (confirm(`Delete ${checkedIds.length} item(s)?`)) {
+                    delItemsMut.mutate(checkedIds);
+                  }
+                }}
+              >
+                <Trash2 className="h-4 w-4 sm:mr-2" />
+                <span className="hidden sm:inline">Delete</span>
               </Button>
             </div>
           </div>
@@ -586,6 +790,14 @@ function Reader() {
                           >
                             <ArrowDownToLine className="mr-2 h-4 w-4" />
                             Mark below as read
+                          </DropdownMenuItem>
+                          <DropdownMenuSeparator />
+                          <DropdownMenuItem
+                            className="text-destructive focus:text-destructive"
+                            onClick={() => delItemsMut.mutate([it.id])}
+                          >
+                            <Trash2 className="mr-2 h-4 w-4" />
+                            Delete
                           </DropdownMenuItem>
                         </DropdownMenuContent>
                       </DropdownMenu>

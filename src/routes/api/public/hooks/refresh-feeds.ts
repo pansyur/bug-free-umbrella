@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { extractFeed } from "@/lib/feed-extractor";
+import { extractFeed, filterByPathPrefix } from "@/lib/feed-extractor";
 
 export const Route = createFileRoute("/api/public/hooks/refresh-feeds")({
   server: {
@@ -20,7 +20,7 @@ export const Route = createFileRoute("/api/public/hooks/refresh-feeds")({
 
         const { data: feeds, error } = await supabaseAdmin
           .from("feeds")
-          .select("id,url,user_id");
+          .select("id,url,user_id,item_path_prefix");
         if (error) {
           return new Response(JSON.stringify({ error: error.message }), {
             status: 500,
@@ -42,8 +42,11 @@ export const Route = createFileRoute("/api/public/hooks/refresh-feeds")({
                 last_error: null,
               })
               .eq("id", feed.id);
-            if (extracted.items.length) {
-              const rows = extracted.items.map((it) => ({
+            const keptItems = extracted.isRealFeed
+              ? extracted.items
+              : filterByPathPrefix(extracted.items, feed.item_path_prefix);
+            if (keptItems.length) {
+              const rows = keptItems.map((it) => ({
                 feed_id: feed.id,
                 user_id: feed.user_id,
                 link: it.link,

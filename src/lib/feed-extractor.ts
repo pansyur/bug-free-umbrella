@@ -12,6 +12,14 @@ export interface ExtractedFeed {
   description: string;
   link: string;
   items: FeedItem[];
+  /**
+   * True when `sourceUrl` was a genuine RSS/Atom XML document (either
+   * directly, or discovered via a <link rel="alternate"> tag on an HTML
+   * page). False means `items` came from best-effort HTML scraping, in
+   * which case the caller should let the user confirm/curate which links
+   * are actually articles before saving the feed.
+   */
+  isRealFeed: boolean;
 }
 
 const BROWSER_HEADERS: Record<string, string> = {
@@ -169,18 +177,130 @@ function tryParseXmlFeed(xml: string, sourceUrl: string): ExtractedFeed | null {
     title: channelTitle || sourceUrl,
     description: channelDesc || `Feed for ${sourceUrl}`,
     link: sourceUrl,
-    items,
+    items: sortNewestFirst(items),
+    isRealFeed: true,
+  };
+}
+
+/** Newest-first, by pub date when we have one, otherwise items keep their
+ * scraped/document order (falls to the end). */
+function sortNewestFirst(items: FeedItem[]): FeedItem[] {
+  return [...items].sort((a, b) => {
+    const ta = a.pubDate ? Date.parse(a.pubDate) : NaN;
+    const tb = b.pubDate ? Date.parse(b.pubDate) : NaN;
+    if (Number.isNaN(ta) && Number.isNaN(tb)) return 0;
+    if (Number.isNaN(ta)) return 1;
+    if (Number.isNaN(tb)) return -1;
+    return tb - ta;
+  });
+}
+
+/**
+ * Given a set of links the user confirmed are "real" articles for a scraped
+ * (non-RSS) page, derive a common leading path segment (e.g. "/blog") that
+ * future scrapes can filter on, so nav/category/footer links don't sneak in
+ * as items.
+ */
+export function derivePathPrefix(links: string[]): string | undefined {
+  const paths: string[][] = [];
+  for (const link of links) {
+    try {
+      const u = new URL(link);
+      const segments = u.pathname.split("/").filter(Boolean);
+      if (segments.length > 1) paths.push(segments.slice(0, -1));
+    } catch {
+      // ignore invalid urls
+    }
+  }
+  if (paths.length === 0) return undefined;
+
+  const shortest = Math.min(...paths.map((p) => p.length));
+  const common: string[] = [];
+  for (let i = 0; i < shortest; i++) {
+    const seg = paths[0][i];
+    if (paths.every((p) => p[i] === seg)) common.push(seg);
+    else break;
+  }
+  if (common.length === 0) return undefined;
+  return `/${common.join("/")}`;
+}
+
+/** Filters scraped items down to ones whose link path starts with the
+ * remembered prefix. No-op (returns items unchanged) if there's no prefix,
+ * or if applying it would wipe out every item (site structure changed). */
+export function filterByPathPrefix(
+  items: FeedItem[],
+  pathPrefix: string | null | undefined,
+): FeedItem[] {
+  if (!pathPrefix) return items;
+  const filtered = items.filter((it) => {
+    try {
+      return new URL(it.link).pathname.startsWith(pathPrefix);
+    } catch {
+      return false;
+    }
+  });
+  return filtered.length > 0 ? filtered : items;
+}
+
+function discoverFeedLink(html: string, sourceUrl: string): string | undefined {
+  // <link rel="alternate" type="application/rss+xml" href="...">
+  const linkTagRegex = /<link\b[^>]*>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = linkTagRegex.exec(html)) !== null) {
+    const tag = m[0];
+    if (!/rel=["'][^"']*alternate[^"']*["']/i.test(tag)) continue;
+    if (!/type=["'](application\/(?:rss|atom)\+xml|application\/xml|text\/xml)["']/i.test(tag))
+      continue;
+    const href = tag.match(/href=["']([^"']+)["']/i)?.[1];
+    if (href) return absoluteUrl(href, sourceUrl);
+  }
+  return undefined;
+}
+
+function extractArticleAsItem(html: string, sourceUrl: string): FeedItem {
+  const title =
+    extractMeta(html, "og:title") ||
+    extractMeta(html, "twitter:title") ||
+    html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]?.trim() ||
+    sourceUrl;
+  const description =
+    extractMeta(html, "og:description") ||
+    extractMeta(html, "description") ||
+    extractMeta(html, "twitter:description") ||
+    title;
+  const pubRaw =
+    extractMeta(html, "article:published_time") ||
+    extractMeta(html, "og:published_time") ||
+    extractMeta(html, "date") ||
+    extractMeta(html, "pubdate");
+  const pubDate = pubRaw ? new Date(pubRaw).toUTCString() : new Date().toUTCString();
+  return {
+    title: stripTags(title),
+    link: sourceUrl,
+    description: stripTags(description),
+    pubDate: pubDate !== "Invalid Date" ? pubDate : undefined,
   };
 }
 
 export async function extractFeed(sourceUrl: string): Promise<ExtractedFeed> {
   const html = await fetchWithBypass(sourceUrl);
 
-  // Prefer a real RSS/Atom parse when the source actually is a feed —
-  // this is what makes item titles correct (true <title> per item)
-  // instead of the best-effort link-text guess used for plain web pages.
+  // 1. Real RSS/Atom XML feed
   const xmlFeed = tryParseXmlFeed(html, sourceUrl);
   if (xmlFeed) return xmlFeed;
+
+  // 2. HTML page — auto-discover a linked RSS/Atom feed and follow it
+  const discovered = discoverFeedLink(html, sourceUrl);
+  if (discovered && discovered !== sourceUrl) {
+    try {
+      const feedXml = await fetchWithBypass(discovered);
+      const parsed = tryParseXmlFeed(feedXml, discovered);
+      if (parsed) return parsed;
+    } catch {
+      // fall through to scraping
+    }
+  }
 
   const siteTitle =
     extractMeta(html, "og:site_name") ||
@@ -192,7 +312,7 @@ export async function extractFeed(sourceUrl: string): Promise<ExtractedFeed> {
     extractMeta(html, "description") ||
     `Auto-generated RSS feed for ${sourceUrl}`;
 
-  // Find candidate links: <a href="..."> with visible text
+  // 3. Try to scrape article links from a listing/index page
   const linkRegex = /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
   const seen = new Set<string>();
   const items: FeedItem[] = [];
@@ -213,14 +333,12 @@ export async function extractFeed(sourceUrl: string): Promise<ExtractedFeed> {
     if (!rawHref || rawHref.startsWith("#") || rawHref.startsWith("javascript:")) continue;
 
     const href = absoluteUrl(rawHref, sourceUrl);
-    // Only same-origin or same-host children
     try {
       const u = new URL(href);
       if (origin && u.origin !== origin) continue;
-      // Skip common non-article paths
       if (/\/(tag|category|author|page|search|login|signup|about|contact|privacy|terms)(\/|$)/i.test(u.pathname)) continue;
-      // Skip root-only
       if (u.pathname === "/" || u.pathname === "") continue;
+      if (u.href === sourceUrl) continue;
     } catch {
       continue;
     }
@@ -243,11 +361,17 @@ export async function extractFeed(sourceUrl: string): Promise<ExtractedFeed> {
     if (items.length >= 30) break;
   }
 
+  // 4. Newsletter / single-article fallback — treat the page itself as one item
+  if (items.length === 0) {
+    items.push(extractArticleAsItem(html, sourceUrl));
+  }
+
   return {
     title: stripTags(siteTitle),
     description: stripTags(siteDesc),
     link: sourceUrl,
-    items,
+    items: sortNewestFirst(items),
+    isRealFeed: false,
   };
 }
 
