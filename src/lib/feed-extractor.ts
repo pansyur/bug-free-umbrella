@@ -181,7 +181,7 @@ async function fetchXmlWithBypass(url: string): Promise<string> {
   );
 }
 
-
+function extractMeta(html: string, prop: string): string | undefined {
   const patterns = [
     new RegExp(
       `<meta[^>]+(?:property|name)=["']${prop}["'][^>]*content=["']([^"']+)["']`,
