@@ -60,25 +60,90 @@ function absoluteUrl(href: string, base: string): string {
   }
 }
 
-async function fetchWithBypass(url: string): Promise<string> {
-  // Try direct fetch first with browser-like headers
-  try {
-    const res = await fetch(url, { headers: BROWSER_HEADERS, redirect: "follow" });
-    if (res.ok) return await res.text();
-    if (res.status !== 403 && res.status !== 503 && res.status !== 429) {
-      throw new Error(`Upstream returned ${res.status}`);
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Fetch a URL directly, retrying once with a short backoff if the site
+ * responds with 429 (rate limited) — a lot of sites just need a beat before
+ * they'll answer again.
+ */
+async function tryFetchDirect(url: string): Promise<{ text?: string; status?: number }> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const res = await fetch(url, { headers: BROWSER_HEADERS, redirect: "follow" });
+      if (res.ok) return { text: await res.text() };
+      if (res.status === 429 && attempt === 0) {
+        await sleep(1200 + Math.random() * 800);
+        continue;
+      }
+      return { status: res.status };
+    } catch {
+      // Network-level failure (DNS, TLS, timeout) — let the caller fall
+      // back to a proxy instead of retrying the same dead end.
+      return {};
     }
-  } catch {
-    // fall through
+  }
+  return {};
+}
+
+/** Try a single proxy URL, retrying once on 429. Throws with a short reason
+ * on failure so the caller can report what actually happened. */
+async function tryFetchProxy(proxyUrl: string): Promise<string> {
+  let lastStatus: number | undefined;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const res = await fetch(proxyUrl, {
+      headers: { "User-Agent": BROWSER_HEADERS["User-Agent"], Accept: "text/html,*/*" },
+    });
+    if (res.ok) return await res.text();
+    lastStatus = res.status;
+    if (res.status === 429 && attempt === 0) {
+      await sleep(1200 + Math.random() * 800);
+      continue;
+    }
+    break;
+  }
+  throw new Error(`proxy returned ${lastStatus}`);
+}
+
+/**
+ * Fetch a page's HTML, working around the two most common failure modes for
+ * "add this URL as a feed": the site rate-limiting us (429) or blocking
+ * non-browser requests (403/503). We retry the direct request briefly, then
+ * fall back to a couple of read-only rendering proxies before giving up with
+ * a message that explains what actually happened.
+ */
+async function fetchWithBypass(url: string): Promise<string> {
+  const direct = await tryFetchDirect(url);
+  if (direct.text !== undefined) return direct.text;
+
+  // Only worth trying a proxy for statuses that usually mean "blocking
+  // automation" — not things like 404/410 that a proxy won't fix.
+  if (direct.status !== undefined && ![403, 429, 503].includes(direct.status)) {
+    throw new Error(
+      `That page returned a ${direct.status} — double check the URL is correct and publicly reachable.`,
+    );
   }
 
-  // Fallback: use a public read-only proxy that renders JS and bypasses CF
-  const proxied = `https://r.jina.ai/${url}`;
-  const res = await fetch(proxied, {
-    headers: { "User-Agent": BROWSER_HEADERS["User-Agent"], Accept: "text/html,*/*" },
-  });
-  if (!res.ok) throw new Error(`Failed to fetch page (${res.status})`);
-  return await res.text();
+  const proxies = [
+    `https://r.jina.ai/${url}`,
+    `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+  ];
+
+  const failures: string[] = direct.status ? [`direct request: ${direct.status}`] : [];
+  for (const proxyUrl of proxies) {
+    try {
+      return await tryFetchProxy(proxyUrl);
+    } catch (e) {
+      failures.push(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  throw new Error(
+    `Couldn't fetch that page after retrying (${failures.join("; ")}). The site is likely ` +
+      `rate-limiting or blocking automated requests right now — wait a bit and try again.`,
+  );
 }
 
 function extractMeta(html: string, prop: string): string | undefined {

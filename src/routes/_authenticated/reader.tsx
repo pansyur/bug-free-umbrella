@@ -22,6 +22,9 @@ import {
   ArrowUpToLine,
   ArrowDownToLine,
   ChevronLeft,
+  Search,
+  ListPlus,
+  X,
 } from "lucide-react";
 
 import { supabase } from "@/integrations/supabase/client";
@@ -37,6 +40,12 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog";
 import { Sheet, SheetContent } from "@/components/ui/sheet";
+import { Textarea } from "@/components/ui/textarea";
+import {
+  Tabs,
+  TabsList,
+  TabsTrigger,
+} from "@/components/ui/tabs";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -46,6 +55,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import {
   addFeed,
+  bulkAddFeeds,
   deleteFeed,
   deleteItems,
   deleteReadItems,
@@ -102,6 +112,25 @@ function Reader() {
   const [setupFeed, setSetupFeed] = useState<ExtractedFeed | null>(null);
   const [setupSelected, setSetupSelected] = useState<Record<string, boolean>>({});
 
+  // Bulk-add: paste many URLs at once instead of curating one at a time.
+  const [addMode, setAddMode] = useState<"single" | "bulk">("single");
+  const [bulkText, setBulkText] = useState("");
+  const [bulkResults, setBulkResults] = useState<
+    { url: string; ok: boolean; title?: string; itemCount?: number; error?: string }[] | null
+  >(null);
+
+  // Filter the feed list in the sidebar by title/url.
+  const [feedFilter, setFeedFilter] = useState("");
+
+  // Search articles by title/description. Debounced so we're not firing a
+  // query on every keystroke.
+  const [itemSearchInput, setItemSearchInput] = useState("");
+  const [itemSearch, setItemSearch] = useState("");
+  useEffect(() => {
+    const t = window.setTimeout(() => setItemSearch(itemSearchInput.trim()), 300);
+    return () => window.clearTimeout(t);
+  }, [itemSearchInput]);
+
   function setUnreadOnlyPersisted(v: boolean) {
     setUnreadOnly(v);
     if (typeof window !== "undefined") {
@@ -112,6 +141,7 @@ function Reader() {
   const feedsFn = useServerFn(listFeeds);
   const itemsFn = useServerFn(listItems);
   const addFn = useServerFn(addFeed);
+  const bulkAddFn = useServerFn(bulkAddFeeds);
   const previewSetupFn = useServerFn(previewFeedSetup);
   const delFn = useServerFn(deleteFeed);
   const delItemsFn = useServerFn(deleteItems);
@@ -128,12 +158,13 @@ function Reader() {
   });
 
   const itemsQuery = useQuery({
-    queryKey: ["items", selected, unreadOnly],
+    queryKey: ["items", selected, unreadOnly, itemSearch],
     queryFn: () =>
       itemsFn({
         data: {
           feedId: selected === "__all__" ? null : selected,
           unreadOnly,
+          search: itemSearch || undefined,
         },
       }),
     refetchInterval: 60_000,
@@ -141,7 +172,7 @@ function Reader() {
 
   useEffect(() => {
     setChecked({});
-  }, [selected, unreadOnly]);
+  }, [selected, unreadOnly, itemSearch]);
 
   // Close the mobile sidebar drawer whenever a feed is picked
   useEffect(() => {
@@ -188,6 +219,26 @@ function Reader() {
       setAddOpen(false);
       setSetupFeed(null);
       setSetupSelected({});
+      qc.invalidateQueries({ queryKey: ["feeds"] });
+      qc.invalidateQueries({ queryKey: ["items"] });
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
+
+  const bulkAddMut = useMutation({
+    mutationFn: (urls: string[]) => bulkAddFn({ data: { urls } }),
+    onSuccess: (res) => {
+      setBulkResults(res.results);
+      const okCount = res.results.filter((r) => r.ok).length;
+      const failCount = res.results.length - okCount;
+      if (okCount > 0) {
+        toast.success(
+          `Added ${okCount} feed${okCount === 1 ? "" : "s"}` +
+            (failCount > 0 ? ` (${failCount} failed)` : ""),
+        );
+      } else {
+        toast.error("Couldn't add any of those feeds");
+      }
       qc.invalidateQueries({ queryKey: ["feeds"] });
       qc.invalidateQueries({ queryKey: ["items"] });
     },
@@ -264,6 +315,12 @@ function Reader() {
   const selectedFeed =
     selected === "__all__" ? null : feeds.find((f) => f.id === selected);
 
+  const filteredFeeds = useMemo(() => {
+    const q = feedFilter.trim().toLowerCase();
+    if (!q) return feeds;
+    return feeds.filter((f) => (f.title || f.url).toLowerCase().includes(q));
+  }, [feeds, feedFilter]);
+
   const checkedIds = Object.keys(checked).filter((k) => checked[k]);
   const allChecked = items.length > 0 && checkedIds.length === items.length;
 
@@ -318,6 +375,9 @@ function Reader() {
               setSetupFeed(null);
               setSetupSelected({});
               setNewUrl("");
+              setAddMode("single");
+              setBulkText("");
+              setBulkResults(null);
             }
           }}
         >
@@ -327,7 +387,7 @@ function Reader() {
               Add feed
             </Button>
           </DialogTrigger>
-          <DialogContent className={setupFeed ? "sm:max-w-lg" : undefined}>
+          <DialogContent className={setupFeed || addMode === "bulk" ? "sm:max-w-lg" : undefined}>
             {!setupFeed ? (
               <>
                 <DialogHeader>
@@ -335,43 +395,137 @@ function Reader() {
                     Enchant a new URL
                   </DialogTitle>
                 </DialogHeader>
-                <form
-                  onSubmit={(e) => {
-                    e.preventDefault();
-                    try {
-                      new URL(newUrl);
-                    } catch {
-                      toast.error("Add https:// to the beginning");
-                      return;
-                    }
-                    previewMut.mutate(newUrl);
+                <Tabs
+                  value={addMode}
+                  onValueChange={(v) => {
+                    setAddMode(v as "single" | "bulk");
+                    setBulkResults(null);
                   }}
-                  className="space-y-3"
                 >
-                  <Input
-                    value={newUrl}
-                    onChange={(e) => setNewUrl(e.target.value)}
-                    placeholder="https://a-lovely-blog.example"
-                    autoFocus
-                  />
-                  <p className="text-xs text-muted-foreground">
-                    If this isn't a real RSS/Atom feed, we'll scan the page and let
-                    you confirm which links are actual articles.
-                  </p>
-                  <DialogFooter>
-                    <Button
-                      type="submit"
-                      disabled={previewMut.isPending || addMut.isPending || !newUrl}
-                    >
-                      {previewMut.isPending || addMut.isPending ? (
-                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                      ) : (
-                        <Sparkles className="mr-2 h-4 w-4" />
-                      )}
-                      Cast feed
-                    </Button>
-                  </DialogFooter>
-                </form>
+                  <TabsList className="grid w-full grid-cols-2">
+                    <TabsTrigger value="single">Single URL</TabsTrigger>
+                    <TabsTrigger value="bulk">Bulk import</TabsTrigger>
+                  </TabsList>
+                </Tabs>
+                {addMode === "single" ? (
+                  <form
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      try {
+                        new URL(newUrl);
+                      } catch {
+                        toast.error("Add https:// to the beginning");
+                        return;
+                      }
+                      previewMut.mutate(newUrl);
+                    }}
+                    className="space-y-3"
+                  >
+                    <Input
+                      value={newUrl}
+                      onChange={(e) => setNewUrl(e.target.value)}
+                      placeholder="https://a-lovely-blog.example"
+                      autoFocus
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      If this isn't a real RSS/Atom feed, we'll scan the page and let
+                      you confirm which links are actual articles.
+                    </p>
+                    <DialogFooter>
+                      <Button
+                        type="submit"
+                        disabled={previewMut.isPending || addMut.isPending || !newUrl}
+                      >
+                        {previewMut.isPending || addMut.isPending ? (
+                          <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                        ) : (
+                          <Sparkles className="mr-2 h-4 w-4" />
+                        )}
+                        Cast feed
+                      </Button>
+                    </DialogFooter>
+                  </form>
+                ) : (
+                  <form
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      const urls = [
+                        ...new Set(
+                          bulkText
+                            .split(/[\n,]+/)
+                            .map((s) => s.trim())
+                            .filter(Boolean),
+                        ),
+                      ];
+                      const invalid = urls.filter((u) => {
+                        try {
+                          new URL(u);
+                          return false;
+                        } catch {
+                          return true;
+                        }
+                      });
+                      if (urls.length === 0) {
+                        toast.error("Paste at least one URL");
+                        return;
+                      }
+                      if (invalid.length > 0) {
+                        toast.error(
+                          `${invalid.length} line(s) aren't valid URLs — add https:// to each`,
+                        );
+                        return;
+                      }
+                      if (urls.length > 50) {
+                        toast.error("Max 50 URLs at a time");
+                        return;
+                      }
+                      setBulkResults(null);
+                      bulkAddMut.mutate(urls);
+                    }}
+                    className="space-y-3"
+                  >
+                    <Textarea
+                      value={bulkText}
+                      onChange={(e) => setBulkText(e.target.value)}
+                      placeholder={"https://blog-one.example\nhttps://blog-two.example/feed\nhttps://another-site.example"}
+                      className="min-h-32 font-mono text-xs"
+                      autoFocus
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      One URL per line (or comma-separated). Each is added with its
+                      default settings — real feeds import as-is, and scraped pages
+                      keep every article link found.
+                    </p>
+                    {bulkResults && (
+                      <div className="max-h-40 space-y-1 overflow-y-auto rounded-md border border-border p-2">
+                        {bulkResults.map((r) => (
+                          <div key={r.url} className="flex items-start gap-2 text-xs">
+                            <span
+                              className={
+                                r.ok ? "text-primary" : "text-destructive"
+                              }
+                            >
+                              {r.ok ? "✓" : "✗"}
+                            </span>
+                            <span className="min-w-0 flex-1 truncate">
+                              {r.ok ? r.title || r.url : `${r.url} — ${r.error}`}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    <DialogFooter>
+                      <Button type="submit" disabled={bulkAddMut.isPending || !bulkText.trim()}>
+                        {bulkAddMut.isPending ? (
+                          <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                        ) : (
+                          <ListPlus className="mr-2 h-4 w-4" />
+                        )}
+                        Add feeds
+                      </Button>
+                    </DialogFooter>
+                  </form>
+                )}
               </>
             ) : (
               <>
@@ -481,15 +635,31 @@ function Reader() {
           Feeds ({feeds.length})
         </div>
 
+        {feeds.length > 4 && (
+          <div className="relative mb-2 px-1">
+            <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              value={feedFilter}
+              onChange={(e) => setFeedFilter(e.target.value)}
+              placeholder="Filter feeds…"
+              className="h-8 pl-8 text-xs"
+            />
+          </div>
+        )}
+
         {feedsQuery.isLoading ? (
           <div className="p-3 text-xs text-muted-foreground">Loading…</div>
         ) : feeds.length === 0 ? (
           <div className="rounded-lg border border-dashed border-border p-3 text-center text-xs text-muted-foreground">
             No feeds yet. Add one above.
           </div>
+        ) : filteredFeeds.length === 0 ? (
+          <div className="rounded-lg border border-dashed border-border p-3 text-center text-xs text-muted-foreground">
+            No feeds match "{feedFilter}".
+          </div>
         ) : (
           <ul className="space-y-0.5">
-            {feeds.map((f) => (
+            {filteredFeeds.map((f) => (
               <li key={f.id} className="group flex items-stretch">
                 <button
                   onClick={() => setSelected(f.id)}
@@ -579,6 +749,25 @@ function Reader() {
             </div>
           </div>
           <div className="flex flex-wrap items-center gap-2">
+            <div className="relative">
+              <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                value={itemSearchInput}
+                onChange={(e) => setItemSearchInput(e.target.value)}
+                placeholder="Search articles…"
+                className="h-8 w-36 pl-8 pr-7 text-xs sm:w-52"
+              />
+              {itemSearchInput && (
+                <button
+                  type="button"
+                  onClick={() => setItemSearchInput("")}
+                  className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-0.5 text-muted-foreground hover:text-foreground"
+                  aria-label="Clear search"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              )}
+            </div>
             <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
               <Checkbox
                 checked={unreadOnly}
@@ -675,11 +864,13 @@ function Reader() {
             </div>
           ) : items.length === 0 ? (
             <div className="p-12 text-center text-sm text-muted-foreground">
-              {feeds.length === 0
-                ? "Add your first feed to start collecting articles."
-                : unreadOnly
-                  ? "All caught up ✦"
-                  : "No items yet — try refreshing."}
+              {itemSearch
+                ? `No articles match "${itemSearch}".`
+                : feeds.length === 0
+                  ? "Add your first feed to start collecting articles."
+                  : unreadOnly
+                    ? "All caught up ✦"
+                    : "No items yet — try refreshing."}
             </div>
           ) : (
             <>

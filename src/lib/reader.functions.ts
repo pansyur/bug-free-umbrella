@@ -118,6 +118,85 @@ export const addFeed = createServerFn({ method: "POST" })
     return feed;
   });
 
+// Add many feeds at once (one URL per line pasted by the user). Each URL is
+// processed independently and sequentially — sequentially so we don't hammer
+// several different sites with concurrent requests, and independently so one
+// bad URL doesn't fail the whole batch. Scraped (non-RSS) sources keep every
+// link found, same as addFeed does when no selectedLinks are given, since
+// there's no per-link curation step in a bulk flow.
+export const bulkAddFeeds = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input) =>
+    z
+      .object({
+        urls: z.array(z.string().url()).min(1).max(50),
+      })
+      .parse(input),
+  )
+  .handler(async ({ data, context }) => {
+    const { supabase, userId } = context;
+    const results: {
+      url: string;
+      ok: boolean;
+      title?: string;
+      itemCount?: number;
+      isRealFeed?: boolean;
+      error?: string;
+    }[] = [];
+
+    // De-dupe input while preserving order, so pasting the same URL twice
+    // doesn't try to add it twice.
+    const urls = [...new Set(data.urls.map((u) => u.trim()).filter(Boolean))];
+
+    for (const url of urls) {
+      try {
+        const extracted = await extractFeed(url);
+        const { data: feed, error } = await supabase
+          .from("feeds")
+          .upsert(
+            {
+              user_id: userId,
+              url,
+              title: extracted.title,
+              description: extracted.description,
+              last_refreshed_at: new Date().toISOString(),
+              last_error: null,
+            },
+            { onConflict: "user_id,url" },
+          )
+          .select()
+          .single();
+        if (error) throw new Error(error.message);
+
+        if (extracted.items.length) {
+          const rows = extracted.items.map((it) => ({
+            feed_id: feed.id,
+            user_id: userId,
+            link: it.link,
+            title: it.title.slice(0, 500),
+            description: (it.description ?? "").slice(0, 2000),
+            pub_date: it.pubDate ? new Date(it.pubDate).toISOString() : null,
+          }));
+          await supabase
+            .from("feed_items")
+            .upsert(rows, { onConflict: "feed_id,link", ignoreDuplicates: true });
+        }
+
+        results.push({
+          url,
+          ok: true,
+          title: extracted.title,
+          itemCount: extracted.items.length,
+          isRealFeed: extracted.isRealFeed,
+        });
+      } catch (e) {
+        results.push({ url, ok: false, error: e instanceof Error ? e.message : String(e) });
+      }
+    }
+
+    return { results };
+  });
+
 export const listFeeds = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
   .handler(async ({ context }) => {
@@ -156,6 +235,7 @@ export const listItems = createServerFn({ method: "POST" })
         feedId: z.string().uuid().nullable().optional(),
         unreadOnly: z.boolean().optional(),
         limit: z.number().min(1).max(500).optional(),
+        search: z.string().max(200).optional(),
       })
       .parse(input),
   )
@@ -173,6 +253,13 @@ export const listItems = createServerFn({ method: "POST" })
       .limit(data.limit ?? 200);
     if (data.feedId) q = q.eq("feed_id", data.feedId);
     if (data.unreadOnly) q = q.eq("is_read", false);
+    const term = data.search?.trim();
+    if (term) {
+      // Escape ilike wildcards so a literal "%" or "_" in a search doesn't
+      // behave like a wildcard.
+      const escaped = term.replace(/[%_]/g, (c) => `\\${c}`);
+      q = q.or(`title.ilike.%${escaped}%,description.ilike.%${escaped}%`);
+    }
     const { data: items, error } = await q;
     if (error) throw new Error(error.message);
     return items ?? [];
