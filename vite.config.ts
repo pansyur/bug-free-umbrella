@@ -19,13 +19,11 @@ export default defineConfig({
     tsConfigPaths({ projects: ["./tsconfig.json"] }),
     tailwindcss(),
     tanstackStart({
-      server: {
-        // Redirect TanStack Start's bundled server entry to src/server.ts
-        // (our SSR error wrapper).
-        entry: "server",
-        // Nitro preset for Cloudflare Pages/Workers output.
-        preset: "cloudflare_module",
-      },
+  server: {
+    entry: "server",
+    preset: "cloudflare_pages",   // was "cloudflare_module"
+  },
+}),
     }),
     viteReact(),
   ],
